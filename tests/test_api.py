@@ -261,3 +261,233 @@ def test_chapters_unknown_field_rejected():
         },
     )
     assert response.status_code == 422
+
+
+def test_reprint_unchanged_reuses_all():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["p1", "p2", "p3", "p4"],
+            "new_page_ids": ["p1", "p2", "p3", "p4"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["signature_count"] == 1
+    assert data["reprint_sheet_count"] == 0
+    sheet = data["signatures"][0]["sheets"][0]
+    assert sheet["front"] == {"left": "p4", "right": "p1"}
+    assert sheet["back"] == {"left": "p2", "right": "p3"}
+    assert sheet["reused"] is True
+    assert sheet["old_signature_index"] == 1
+    assert sheet["old_sheet_index"] == 1
+
+
+def test_reprint_changed_page_marks_sheet():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["p1", "p2", "p3", "p4"],
+            "new_page_ids": ["p1", "p2X", "p3", "p4"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": ["p2X"],
+        },
+    )
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert sheet["reused"] is False
+    assert sheet["old_signature_index"] is None
+    assert sheet["old_sheet_index"] is None
+    # 新版四页位照常返回
+    assert sheet["back"] == {"left": "p2X", "right": "p3"}
+    assert response.json()["reprint_sheet_count"] == 1
+
+
+def test_reprint_cross_signature():
+    old_ids = [f"p{i:02d}" for i in range(1, 25)]
+    new_ids = [f"p{i:02d}" for i in list(range(17, 25)) + list(range(9, 17)) + list(range(1, 9))]
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": old_ids,
+            "new_page_ids": new_ids,
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["reprint_sheet_count"] == 0
+    first_sheet = data["signatures"][0]["sheets"][0]
+    assert first_sheet["reused"] is True
+    # 新帖 1 的 8 页块来自旧帖 3
+    assert first_sheet["old_signature_index"] == 3
+    assert first_sheet["old_sheet_index"] == 1
+
+
+def test_reprint_right_binding():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a", "b", "c", "d"],
+            "new_page_ids": ["a", "b", "c", "d"],
+            "max_sheets_per_signature": 2,
+            "binding": "right",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert sheet["front"] == {"left": "a", "right": "d"}
+    assert sheet["reused"] is True
+
+
+def test_reprint_blank_positions_null():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a"],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 1,
+            "binding": "left",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert sheet["front"] == {"left": None, "right": "a"}
+    assert sheet["back"] == {"left": None, "right": None}
+    assert sheet["reused"] is True
+
+
+def test_reprint_empty_old_page_ids():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": [],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_blank_page_id_string():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a", "  "],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_duplicate_page_id_within_version():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a", "b"],
+            "new_page_ids": ["a", "a"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_changed_id_not_in_new_version():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a", "b"],
+            "new_page_ids": ["a", "b"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": ["c"],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_changed_id_may_repeat():
+    # changed_page_ids 不要求去重
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a", "b"],
+            "new_page_ids": ["a", "b"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": ["a", "a"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["reprint_sheet_count"] == 1
+
+
+def test_reprint_invalid_max_sheets():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a"],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 0,
+            "binding": "left",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_invalid_binding():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a"],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 2,
+            "binding": "top",
+            "changed_page_ids": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_unknown_field_rejected():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a"],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "changed_page_ids": [],
+            "extra": 1,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_missing_field():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a"],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+        },
+    )
+    assert response.status_code == 422

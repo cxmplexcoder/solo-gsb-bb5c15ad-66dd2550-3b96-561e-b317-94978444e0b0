@@ -17,9 +17,12 @@
 """
 from __future__ import annotations
 
-from typing import List, Literal, Optional, Tuple
+from typing import Collection, List, Literal, Optional, Tuple, TypeVar
 
 Binding = Literal["left", "right"]
+
+# 页面标识类型：页码（int）或页面 ID（str）
+P = TypeVar("P")
 
 # 单张纸的一页描述：(全局页码或 None, 在帖内纸张上的位置)
 # side: "front" 正面 / "back" 背面；position: "left" 左页 / "right" 右页
@@ -48,13 +51,13 @@ def split_signatures(total_pages: int, max_sheets: int) -> List[List[Optional[in
 
 
 def impose_signature(
-    pages: List[Optional[int]],
+    pages: List[Optional[P]],
     binding: Binding,
 ) -> List[dict]:
     """对一个帖拼版，按纸张从外到内返回各张正反面的左右页码。
 
-    ``pages`` 长度必须为 ``4s``（``s`` 为纸张数），其中保存的已是**全局页码**；
-    末帖补齐位置为 ``None``，对应页位返回 ``null``。
+    ``pages`` 长度必须为 ``4s``（``s`` 为纸张数），其中保存的已是**全局页码**
+    （重印接口中为页面 ID）；末帖补齐位置为 ``None``，对应页位返回 ``null``。
     """
     sheet_count = len(pages) // 4
     n = len(pages)  # 帖页数（含补齐的空白）
@@ -195,3 +198,154 @@ def impose_chapters(
             }
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 重印（reprint）：基于页面 ID 的两版拼版复用
+# ---------------------------------------------------------------------------
+
+# 一张印张四个页位的键：(正面左, 正面右, 背面左, 背面右)，空白页位为 None
+SheetKey = Tuple[Optional[P], Optional[P], Optional[P], Optional[P]]
+
+
+def split_signatures_from_pages(
+    page_ids: List[P],
+    max_sheets: int,
+) -> List[List[Optional[P]]]:
+    """按阅读顺序把页面 ID 分帖，规则与 :func:`split_signatures` 相同。
+
+    每帖最多容纳 ``max_sheets * 4`` 页，前面的帖装满；仅末帖在尾部补 ``None``
+    至 4 的倍数。
+    """
+    capacity = max_sheets * 4
+    signatures: List[List[Optional[P]]] = []
+
+    start = 0
+    total = len(page_ids)
+    while start < total:
+        end = min(start + capacity, total)
+        pages: List[Optional[P]] = list(page_ids[start:end])
+        if len(pages) % 4 != 0:
+            pages.extend([None] * (4 - len(pages) % 4))
+        signatures.append(pages)
+        start = end
+
+    return signatures
+
+
+def impose_from_pages(
+    page_ids: List[P],
+    max_sheets: int,
+    binding: Binding,
+) -> List[dict]:
+    """页面 ID 版本的完整拼版：分帖并逐帖返回四页位（ID 或 ``None``）。"""
+    grouped = split_signatures_from_pages(page_ids, max_sheets)
+    result: List[dict] = []
+    for index, pages in enumerate(grouped, start=1):
+        result.append(
+            {
+                "signature_index": index,
+                "sheet_count": len(pages) // 4,
+                "page_count_padded": len(pages),
+                "sheets": impose_signature(pages, binding),
+            }
+        )
+    return result
+
+
+def _sheet_key(sheet: dict) -> SheetKey:
+    """取一张拼版结果四个页位，构成可比较的键（正左、正右、背左、背右）。"""
+    return (
+        sheet["front"]["left"],
+        sheet["front"]["right"],
+        sheet["back"]["left"],
+        sheet["back"]["right"],
+    )
+
+
+def plan_reprint(
+    old_page_ids: List[P],
+    new_page_ids: List[P],
+    max_sheets: int,
+    binding: Binding,
+    changed_page_ids: Collection[P],
+) -> dict:
+    """计算新版各印张能否复用旧版印张，否则标记整张重印。
+
+    复用条件（缺一不可）：
+
+    1. 新版印张四个页位（``None`` 表示空白）与某张旧版印张**完全相同**，
+       允许跨帖匹配；
+    2. 四个页位中的非空页面 ID 均不在 ``changed_page_ids`` 内；
+    3. 每张旧版印张最多被复用一次。
+
+    含空白页位的多张印张键可能相同（全空白张），按旧版帖号、张号顺序取用，
+    保证结果确定。按新版帖号、张号顺序依次匹配可最大化复用张数：一旦一张新
+    张被标记重印，相应的旧张仍留给后续新张。
+
+    返回新版逐帖的复用/重印计划与重印总张数。
+    """
+    old_imposed = impose_from_pages(old_page_ids, max_sheets, binding)
+    new_imposed = impose_from_pages(new_page_ids, max_sheets, binding)
+    changed = set(changed_page_ids)
+
+    # 旧版各四页位组合对应的可用印张列表（旧帖号, 旧张号），按帖号、张号排序
+    available: dict = {}
+    for signature in old_imposed:
+        for sheet in signature["sheets"]:
+            available.setdefault(_sheet_key(sheet), []).append(
+                (signature["signature_index"], sheet["sheet_index"])
+            )
+
+    reprint_count = 0
+    result_signatures: List[dict] = []
+
+    for signature in new_imposed:
+        result_sheets: List[dict] = []
+        for sheet in signature["sheets"]:
+            key = _sheet_key(sheet)
+            is_changed = any(
+                page_id is not None and page_id in changed for page_id in key
+            )
+            reuse: Optional[Tuple[int, int]] = None
+            if not is_changed:
+                candidates = available.get(key)
+                if candidates:
+                    reuse = candidates.pop(0)
+
+            if reuse is None:
+                reused = False
+                old_signature_index: Optional[int] = None
+                old_sheet_index: Optional[int] = None
+                reprint_count += 1
+            else:
+                reused = True
+                old_signature_index, old_sheet_index = reuse
+
+            result_sheets.append(
+                {
+                    "sheet_index": sheet["sheet_index"],
+                    "front": sheet["front"],
+                    "back": sheet["back"],
+                    "reused": reused,
+                    "old_signature_index": old_signature_index,
+                    "old_sheet_index": old_sheet_index,
+                }
+            )
+
+        result_signatures.append(
+            {
+                "signature_index": signature["signature_index"],
+                "sheet_count": signature["sheet_count"],
+                "page_count_padded": signature["page_count_padded"],
+                "sheets": result_sheets,
+            }
+        )
+
+    return {
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "signature_count": len(result_signatures),
+        "reprint_sheet_count": reprint_count,
+        "signatures": result_signatures,
+    }
