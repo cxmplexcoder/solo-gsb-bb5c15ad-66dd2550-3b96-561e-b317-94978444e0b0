@@ -7,6 +7,8 @@ from app.imposition import (
     impose_signature,
     impose,
     impose_chapters,
+    impose_ids,
+    plan_reprint,
 )
 
 
@@ -195,3 +197,111 @@ def test_impose_chapters_page_coverage_and_right_binding():
     assert sorted(seen) == list(range(1, 21))
     # 右装订镜像：首帖最外张正面 = 首页/末页
     assert result[0]["sheets"][0]["front"] == {"left": 1, "right": 4}
+
+
+def test_impose_ids_matches_impose_layout_with_none_blanks():
+    ids = [f"p{i}" for i in range(1, 6)]  # 5 页 -> 补 3 空白
+    result = impose_ids(ids, 4, "left")
+    assert len(result) == 1
+    sheets = result[0]["sheets"]
+    # 与 impose(5, 4, "left") 同构，仅页码换成 ID
+    assert sheets[0]["front"] == {"left": None, "right": "p1"}
+    assert sheets[0]["back"] == {"left": "p2", "right": None}
+    assert sheets[1]["back"] == {"left": "p4", "right": "p5"}
+
+
+def test_reprint_identical_versions_reuse_every_sheet():
+    ids = [f"p{i}" for i in range(1, 9)]
+    result = plan_reprint(ids, ids, 2, "left", [])
+    assert result["reprint_sheet_count"] == 0
+    assert result["signature_count"] == 1
+    for sheet in result["signatures"][0]["sheets"]:
+        assert sheet["reused"] is True
+        assert sheet["reprint"] is False
+        assert (sheet["old_signature_index"], sheet["old_sheet_index"]) == (1, sheet["sheet_index"])
+
+
+def test_reprint_changed_page_blocks_its_sheet_only():
+    ids = [f"p{i}" for i in range(1, 9)]
+    result = plan_reprint(ids, ids, 2, "left", ["p3"])
+    assert result["reprint_sheet_count"] == 1
+    # p3 位于第 2 张（最内张），第 1 张仍可复用
+    sheets = result["signatures"][0]["sheets"]
+    assert sheets[0]["reused"] is True
+    assert sheets[1]["reused"] is False
+    assert sheets[1]["old_signature_index"] is None
+    assert sheets[1]["old_sheet_index"] is None
+
+
+def test_reprint_changed_blank_position_is_untouched():
+    # 1 页补 3 空白：空白位不算改动，唯一印张可复用
+    result = plan_reprint(["a"], ["a"], 1, "left", [])
+    sheet = result["signatures"][0]["sheets"][0]
+    assert sheet["reused"] is True
+    assert sheet["front"] == {"left": None, "right": "a"}
+
+
+def test_reprint_cross_signature_matching():
+    old = [f"p{i}" for i in range(1, 17)]
+    # 新版把原 5-8 与 1-4 两个帖整体对调，每帖 4 页（每帖 1 张）
+    new = [f"p{i}" for i in range(5, 9)] + [f"p{i}" for i in range(1, 5)] + [
+        f"p{i}" for i in range(9, 17)
+    ]
+    result = plan_reprint(old, new, 1, "left", [])
+    assert result["reprint_sheet_count"] == 0
+    matches = [
+        (s["signature_index"], sh["old_signature_index"])
+        for s in result["signatures"]
+        for sh in s["sheets"]
+    ]
+    # 新帖 1 复用旧帖 2，新帖 2 复用旧帖 1，其余同帖号
+    assert matches == [(1, 2), (2, 1), (3, 3), (4, 4)]
+
+
+def test_reprint_each_old_sheet_matched_at_most_once():
+    # 旧版两个内容相同的帖（每页 ID 仍需唯一，故用镜像等价构造：
+    # 旧版 4 页一帖；新版只有 1 个 4 页版本，不会重复匹配旧张）。
+    old = [f"p{i}" for i in range(1, 5)]
+    new = list(old)
+    result = plan_reprint(old, new, 1, "left", [])
+    old_refs = [
+        (sh["old_signature_index"], sh["old_sheet_index"])
+        for s in result["signatures"]
+        for sh in s["sheets"]
+        if sh["reused"]
+    ]
+    assert len(old_refs) == len(set(old_refs))
+
+
+def test_reprint_unmatched_sheet_is_reprinted():
+    # 新版新增 4 页：新帖 1 与旧版相同可复用，新帖 2 为全新印张
+    old = [f"p{i}" for i in range(1, 5)]
+    new = [f"p{i}" for i in range(1, 9)]
+    result = plan_reprint(old, new, 1, "left", [])
+    assert result["signature_count"] == 2
+    assert result["reprint_sheet_count"] == 1
+    assert result["signatures"][0]["sheets"][0]["reused"] is True
+    new_sheet = result["signatures"][1]["sheets"][0]
+    assert new_sheet["reused"] is False
+    assert new_sheet["front"] == {"left": "p8", "right": "p5"}
+
+
+def test_reprint_padding_layout_change_force_reprint():
+    # 5 页补 3 空白 -> 6 页补 2 空白：含 p3..p6 的内张布局改变，必须重印
+    old = [f"p{i}" for i in range(1, 6)]
+    new = [f"p{i}" for i in range(1, 7)]
+    result = plan_reprint(old, new, 4, "left", [])
+    assert result["reprint_sheet_count"] == 1
+    sheets = result["signatures"][0]["sheets"]
+    # 最外张四页位（空白/p1、p2/空白）两版一致 -> 复用
+    assert sheets[0]["reused"] is True
+    assert sheets[1]["reused"] is False
+
+
+def test_reprint_right_binding_mirrors_positions():
+    ids = [f"p{i}" for i in range(1, 5)]
+    result = plan_reprint(ids, ids, 1, "right", [])
+    sheet = result["signatures"][0]["sheets"][0]
+    assert sheet["reused"] is True
+    assert sheet["front"] == {"left": "p1", "right": "p4"}
+    assert sheet["back"] == {"left": "p3", "right": "p2"}

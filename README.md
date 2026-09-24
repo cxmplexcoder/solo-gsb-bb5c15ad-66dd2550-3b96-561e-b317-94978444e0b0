@@ -6,6 +6,10 @@
 另提供**章节分帖**接口 `/api/v1/impose/chapters`：按章节首页页码分帖，章节不可跨帖、
 相邻章节可合帖，并自动选择空白最少、帖数最少的分帖边界。
 
+还提供**补印复用**接口 `/api/v1/impose/reprint`：输入旧版与新版的页面 ID 列表及改动页，
+分别沿用普通拼版规则拼版，逐张判断新版印张可复用哪张旧印张（允许跨帖），否则标记整张重印，
+并返回重印总张数。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -13,6 +17,9 @@
 ```bash
 docker compose up -d --build
 ```
+
+启动成功后服务监听 `http://localhost:8000`（可用 `HOST_PORT` 改宿主机端口），
+健康检查 `GET http://localhost:8000/health` 返回 `{"status":"ok"}` 即就绪。
 
 该命令会自动完成：构建镜像 → 安装全部依赖 → 启动 API（容器内 uvicorn 直接拉起，无数据库等额外初始化步骤）。
 
@@ -44,6 +51,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 拼版接口：`POST http://localhost:8000/api/v1/impose`
 - 章节分帖拼版接口：`POST http://localhost:8000/api/v1/impose/chapters`
+- 补印复用规划接口：`POST http://localhost:8000/api/v1/impose/reprint`
 
 ## 接口说明
 
@@ -191,6 +199,85 @@ curl -X POST http://localhost:8000/api/v1/impose/chapters \
 除与 `/api/v1/impose` 相同的校验外，`chapter_starts` 为空、首项不为 1、未严格递增、
 超过 `total_pages`，或某一单章页数超过 `4 × max_sheets_per_signature` 时，
 均返回 `422 Unprocessable Entity`。
+
+## 补印复用规划（POST /api/v1/impose/reprint）
+
+针对“旧版已印好、新版部分内容改动”的补印场景：分别对旧版与新版沿用普通拼版规则
+（分帖、仅末帖补空白、左/右装订左右页位）拼版，再逐张判断新版印张能否直接复用旧印张，
+不能复用的整张重印，并汇总重印总张数。本地访问地址
+`http://localhost:8000/api/v1/impose/reprint`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/reprint`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `old_page_ids` | 字符串数组 | 非空、每项为非空字符串且互不相同 | 旧版页面 ID，按**阅读顺序**排列 |
+| `new_page_ids` | 字符串数组 | 非空、每项为非空字符串且互不相同 | 新版页面 ID，按**阅读顺序**排列 |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 两版共用的每帖最多纸张数 |
+| `binding` | 字符串 | `left` / `right` | 两版共用的装订方向 |
+| `changed_page_ids` | 字符串数组 | 每项必须属于 `new_page_ids` | 新版内容改动的页面 ID；无改动时传 `[]` |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/reprint \
+  -H "Content-Type: application/json" \
+  -d '{"old_page_ids": ["p1", "p2", "p3", "p4"], "new_page_ids": ["p1", "p2", "p3", "p4"], "max_sheets_per_signature": 1, "binding": "left", "changed_page_ids": []}'
+```
+
+### 响应
+
+按新版**帖号** `signature_index` 与**张号** `sheet_index`（均从 1 开始）逐张返回：
+
+- `reused`：是否复用旧印张；`reprint` 与其互为相反（`true` = 整张重印）；
+- 复用时给出旧版帖号 `old_signature_index` 与旧版张号 `old_sheet_index`（允许跨帖匹配），
+  重印时二者为 `null`；
+- `front` / `back` 的 `left` / `right` 为该新版印张四个页位上的页面 ID，空白页为 `null`；
+- 顶层 `reprint_sheet_count` 为需重印的印张总张数。
+
+```json
+{
+  "max_sheets_per_signature": 1,
+  "binding": "left",
+  "signature_count": 1,
+  "reprint_sheet_count": 0,
+  "signatures": [
+    {
+      "signature_index": 1,
+      "sheet_count": 1,
+      "sheets": [
+        {
+          "sheet_index": 1,
+          "reused": true,
+          "reprint": false,
+          "old_signature_index": 1,
+          "old_sheet_index": 1,
+          "front": { "left": "p4", "right": "p1" },
+          "back":  { "left": "p2", "right": "p3" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 复用与重印规则
+
+1. 旧版、新版各自沿用 `/api/v1/impose` 的分帖、补空白（仅末帖尾部补 `null`）和左右页位规则，
+   把四个页位上的页码换成页面 ID（空白位为 `null`）。
+2. 一张新版印张**仅当**满足全部条件才复用：
+   - 四个页位的页面 ID（含同为空白的 `null`）与某张旧印张**完全相同**；
+   - 这四个页位上的页面 ID 均不在 `changed_page_ids` 中（空白位天然视为未改动）；
+   - 该旧印张尚未被其它新印张匹配——**每张旧印张最多匹配一次**。
+3. 匹配**允许跨帖**：按新版帖号、张号顺序，选取第一张满足条件且未占用的旧印张；
+   不满足上述任一条件（如页位变化、页上有改动、无对应旧印张）则**整张重印**。
+4. 即使页位 ID 与旧版相同，只要其中任一页在 `changed_page_ids` 中，该印张仍须重印。
+
+### 非法参数（4xx）
+
+`old_page_ids` / `new_page_ids` 为空列表或含空字符串、同一版内页面 ID 重复、
+`changed_page_ids` 中存在不属于 `new_page_ids` 的 ID、`max_sheets_per_signature` < 1、
+`binding` 非法、缺少字段或含未定义字段时，均返回 `422 Unprocessable Entity`。
 
 ## 本地开发（不使用 Docker）
 
